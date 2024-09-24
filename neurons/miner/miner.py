@@ -37,11 +37,7 @@ class Miner(BaseMinerNeuron):
         By default, Miner will utilize the LLM API to solve the logic problem.
         """
         try:
-            synapse = await solve(
-                synapse=synapse,
-                openai_client=self.openai_client,
-                model=self.config.miner.llm_client.model,
-            )
+            synapse = await solve(synapse)
             self.num_processing_requests += 1
             self.total_request_in_interval += 1
         except Exception as e:
