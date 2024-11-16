@@ -40,7 +40,7 @@ async def solve(
         # )
         # synapse.logic_answer = response.choices[0].message.content
         
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=50) as client:
             print("---------:", URL_API)
             response = await client.post(
                 URL_API, 
