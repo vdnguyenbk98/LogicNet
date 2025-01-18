@@ -46,7 +46,8 @@ def add_args(cls, parser):
     # Netuid Arg: The netuid of the subnet to connect to.
     parser.add_argument("--netuid", type=int, help="Subnet netuid", default=1)
 
-    neuron_type = "validator" if "miner" not in cls.__name__.lower() else "miner"
+    # Neuron type
+    parser.add_argument("--neuron_type", type=str, help="Neuron type", default="validator")
 
     parser.add_argument(
         "--neuron.epoch_length",
@@ -68,6 +69,30 @@ def add_args(cls, parser):
         help="If set, we dont save events to a log file.",
         default=False,
     )
+
+    parser.add_argument(
+        "--wandb.off",
+        action="store_true",
+        help="Turn off wandb.",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--wandb.project_name",
+        type=str,
+        default="logicnet-mainnet",
+        help="Wandb project to log to.",
+    )
+
+    parser.add_argument(
+        "--wandb.entity",
+        type=str,
+        default="ait-ai",
+        help="Wandb entity to log to.",
+    )
+
+    # Neuron type
+    neuron_type = "validator" if "miner" not in cls.__name__.lower() else "miner"
 
     if neuron_type == "validator":
         parser.add_argument(
@@ -144,24 +169,33 @@ def add_args(cls, parser):
         )
 
         parser.add_argument(
-            "--llm_client.base_url",
+            "--llm_client.base_urls",
             type=str,
             help="The base url for the LLM client",
-            default="http://localhost:8000/v1",
+            # default="http://localhost:8000/v1,https://api.openai.com/v1,https://api.together.xyz/v1",
+            default="null,https://api.openai.com/v1,null",
         )
 
         parser.add_argument(
-            "--llm_client.model",
+            "--llm_client.models",
             type=str,
             help="The model for the LLM client",
-            default="Qwen/Qwen2-7B-Instruct",
+            # default="Qwen/Qwen2.5-7B-Instruct,gpt-4o-mini,meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            default="null,gpt-4o,null",
         )
 
         parser.add_argument(
-            "--llm_client.key",
+            "--llm_client.keys",
             type=str,
             help="The key for the LLM client",
             default="xyz",
+        )
+
+        parser.add_argument(
+            "--dataset_weight",
+            type=str,
+            help="The weight of the dataset",
+            default="40,10,10,10,10,10,10",
         )
 
     else:

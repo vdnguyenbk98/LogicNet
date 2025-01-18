@@ -1,37 +1,44 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+import pickle
 import time
-import bittensor as bt
-import random
-import torch
-from logicnet.base.validator import BaseValidatorNeuron
-from neurons.validator.validator_proxy import ValidatorProxy
-import logicnet as ln
-from logicnet.validator import MinerManager, LogicChallenger, LogicRewarder, MinerInfo
-import traceback
 import threading
-from neurons.validator.core.serving_queue import QueryQueue
+import datetime
+import random
+import traceback
+import torch
 import requests
+from copy import deepcopy
+import bittensor as bt
+import logicnet as ln
+from neurons.validator.validator_proxy import ValidatorProxy
+from logicnet.base.validator import BaseValidatorNeuron
+from logicnet.validator import MinerManager, LogicChallenger, LogicRewarder, MinerInfo
+from logicnet.utils.wandb_manager import WandbManager
+from neurons.validator.core.serving_queue import QueryQueue
 
 
-def init_category(config=None):
+def init_category(config=None, model_rotation_pool=None, dataset_weight=None):
     category = {
         "Logic": {
             "synapse_type": ln.protocol.LogicSynapse,
             "incentive_weight": 1.0,
-            "challenger": LogicChallenger(
-                config.llm_client.base_url,
-                config.llm_client.key,
-                config.llm_client.model,
-            ),
-            "rewarder": LogicRewarder(
-                config.llm_client.base_url,
-                config.llm_client.key,
-                config.llm_client.model,
-            ),
+            "challenger": LogicChallenger(model_rotation_pool, dataset_weight),
+            "rewarder": LogicRewarder(model_rotation_pool),
             "timeout": 64,
         }
     }
     return category
 
+
+## low quality models
+model_blacklist = [
+    "meta-llama/Llama-2-7b-chat-hf",
+    "meta-llama/Llama-2-13b-chat-hf",
+    "mistralai/Mistral-7B-Instruct-v0.2",
+    "mistralai/Mistral-7B-Instruct"
+]
 
 class Validator(BaseValidatorNeuron):
     def __init__(self, config=None):
@@ -40,12 +47,79 @@ class Validator(BaseValidatorNeuron):
         """
         super(Validator, self).__init__(config=config)
         bt.logging.info("\033[1;32m🧠 load_state()\033[0m")
-        self.categories = init_category(self.config)
+
+        ### Initialize model rotation pool ###
+        self.model_rotation_pool = {}
+        openai_key = os.getenv("OPENAI_API_KEY")
+        togetherai_key = os.getenv("TOGETHERAI_API_KEY")
+        if not openai_key and not togetherai_key:
+            bt.logging.warning("OPENAI_API_KEY or TOGETHERAI_API_KEY is not set. Please set it to use OpenAI or TogetherAI.")
+            raise ValueError("OPENAI_API_KEY or TOGETHERAI_API_KEY is not set. Please set it to use OpenAI or TogetherAI and restart the validator.")
+        
+        base_urls = self.config.llm_client.base_urls.split(",")
+        models = self.config.llm_client.models.split(",")
+
+        # Ensure the lists have enough elements
+        # if len(base_urls) < 3 or len(models) < 3:
+        #     bt.logging.warning("base_urls or models configuration is incomplete. Please ensure they have just 3 entries.")
+        #     raise ValueError("base_urls or models configuration is incomplete. Please ensure they have just 3 entries.")
+
+        if len(base_urls) < 1 or len(models) < 1:
+            bt.logging.warning(
+                "base_urls or models configuration is incomplete. Please ensure they have at least 1 entry."
+            )
+            raise ValueError(
+                "base_urls or models configuration is incomplete. Please ensure they have at least 1 entry."
+            )
+        
+        self.model_rotation_pool = {
+            # "vllm": [base_urls[0].strip(), "xyz", models[0]],
+            "openai": [base_urls[1].strip(), openai_key, models[1]],
+            # "togetherai": [base_urls[2].strip(), togetherai_key, models[2]],
+        }
+        # for key, value in self.model_rotation_pool.items():
+        #     if value[2] in model_blacklist:
+        #         bt.logging.warning(f"Model {value[2]} is blacklisted. Please use another model.")
+        #         self.model_rotation_pool[key] = "no use"
+        
+        # Immediately blacklist if it's not "gpt-4o" and force it to be "gpt-4o"
+        if "gpt-4o" not in self.model_rotation_pool["openai"][2]:
+            bt.logging.warning(
+                f"Model must be gpt-4o. Found {self.model_rotation_pool['openai'][2]} instead."
+            )
+            bt.logging.info("Setting OpenAI model to gpt-4o.")
+            self.model_rotation_pool["openai"][2] = "gpt-4o"
+        
+        # Check if 'null' is at the same index in both cli lsts
+        for i in range(3):
+            if base_urls[i].strip() == 'null' or models[i].strip() == 'null':
+                if i == 0:
+                    self.model_rotation_pool["vllm"] = "no use"
+                elif i == 1:
+                    self.model_rotation_pool["openai"] = "no use"
+                elif i == 2:
+                    self.model_rotation_pool["togetherai"] = "no use"
+        
+        # Check if all models are set to "no use"
+        if all(value == "no use" for value in self.model_rotation_pool.values()):
+            bt.logging.warning("All models are set to 'no use'. Validator cannot proceed.")
+            raise ValueError("All models are set to 'no use'. Please configure at least one model and restart the validator.")
+        
+        # Create a model_rotation_pool_without_keys
+        model_rotation_pool_without_keys = {
+            key: "no use" if value == "no use" else [value[0], "Not allowed to see.", value[2]]
+            if key in ["openai", "togetherai"] else value
+            for key, value in self.model_rotation_pool.items()
+        }
+        bt.logging.info(f"Model rotation pool without keys: {model_rotation_pool_without_keys}")
+
+        self.categories = init_category(self.config, self.model_rotation_pool, self.config.dataset_weight)
         self.miner_manager = MinerManager(self)
         self.load_state()
         self.update_scores_on_chain()
         self.sync()
         self.miner_manager.update_miners_identity()
+        self.wandb_manager = WandbManager(neuron = self)
         self.query_queue = QueryQueue(
             list(self.categories.keys()),
             time_per_loop=self.config.loop_base_time,
@@ -77,6 +151,20 @@ class Validator(BaseValidatorNeuron):
         loop_start = time.time()
         self.miner_manager.update_miners_identity()
         self.query_queue.update_queue(self.miner_manager.all_uids_info)
+        self.miner_uids = []
+        self.miner_scores = []
+        self.miner_reward_logs = []
+
+        # Set up wandb log
+        if not self.config.wandb.off:
+            today = datetime.date.today()
+            if (self.wandb_manager.wandb_start_date != today and 
+                hasattr(self.wandb_manager, 'wandb') and 
+                self.wandb_manager.wandb is not None):
+                self.wandb_manager.wandb.finish()
+                self.wandb_manager.init_wandb()
+
+        # Query and reward
         for (
             category,
             uids,
@@ -98,16 +186,17 @@ class Validator(BaseValidatorNeuron):
                 f"\033[1;34m😴 Sleeping for {sleep_per_batch} seconds between batches\033[0m"
             )
             time.sleep(sleep_per_batch)
-
+        
+        # Wait for all threads to complete
         for thread in threads:
             thread.join()
+
+        # Assign incentive rewards
+        self.assign_incentive_rewards(self.miner_uids, self.miner_scores, self.miner_reward_logs)
+
+        # Update scores on chain
         self.update_scores_on_chain()
         self.save_state()
-        bt.logging.info(
-            "\033[1;32m✅ Loop completed, uids info:\n"
-            + str(self.miner_manager.all_uids_info).replace("},", "},\n")
-            + "\033[0m"
-        )
         self.store_miner_infomation()
 
         actual_time_taken = time.time() - loop_start
@@ -137,8 +226,9 @@ class Validator(BaseValidatorNeuron):
             )
             if not synapse:
                 continue
-            base_synapse = synapse.copy()
+            base_synapse = synapse.model_copy()
             synapse = synapse.miner_synapse()
+            bt.logging.info(f"\033[1;34m🧠 Synapse to be sent to miners: {synapse}\033[0m")
             axons = [self.metagraph.axons[int(uid)] for uid in uids]
             bt.logging.debug(f"\033[1;34m🧠 Axon: {axons}\033[0m")
             responses = dendrite.query(
@@ -146,9 +236,6 @@ class Validator(BaseValidatorNeuron):
                 synapse=synapse,
                 deserialize=False,
                 timeout=self.categories[category]["timeout"],
-            )
-            bt.logging.debug(
-                f"\033[1;34m🧠 Miner response: {responses[0].logic_answer}\033[0m"
             )
             reward_responses = [
                 response
@@ -177,7 +264,75 @@ class Validator(BaseValidatorNeuron):
 
                 bt.logging.info(f"\033[1;32m🏆 Scored responses: {rewards}\033[0m")
 
-                self.miner_manager.update_scores(uids, rewards, reward_logs)
+                if rewards and reward_logs and uids: 
+                    self.miner_reward_logs.append(reward_logs)
+                    self.miner_uids.append(uids) 
+                    self.miner_scores.append(rewards)
+
+    def assign_incentive_rewards(self, uids, rewards, reward_logs):
+        """
+        Calculate incentive rewards based on the rank.
+        Get the incentive rewards for the valid responses using the cubic function and valid_rewards rank.
+        """
+        # Flatten the nested lists
+        flat_uids = [uid for uid_list in uids for uid in uid_list]
+        flat_rewards = [reward for reward_list in rewards for reward in reward_list]
+        flat_reward_logs = [log for log_list in reward_logs for log in log_list]
+
+        # Create a dictionary to track the all scores per UID
+        uids_scores = {}
+        uids_logs = {}
+        for uid, reward, log in zip(flat_uids, flat_rewards, flat_reward_logs):
+            if uid not in uids_scores:
+                uids_scores[uid] = []
+                uids_logs[uid] = []
+            uids_scores[uid].append(reward)
+            uids_logs[uid].append(log)
+
+        # Now uids_scores holds all rewards each UID achieved this epoch
+        # Convert them into lists for processing
+        final_uids = list(uids_scores.keys())
+        representative_logs = [logs[0] for logs in uids_logs.values()] 
+               
+        ## compute mean value of rewards
+        final_rewards = [sum(uid_rewards) / len(uid_rewards) for uid_rewards in uids_scores.values()]
+
+        # Now proceed with the incentive rewards calculation on these mean attempts
+        original_rewards = list(enumerate(final_rewards))
+        # Sort and rank as before, but now we're dealing with mean attempts.
+        
+        # Sort rewards in descending order based on the score
+        sorted_rewards = sorted(original_rewards, key=lambda x: x[1], reverse=True)
+        
+        # Calculate ranks, handling ties
+        ranks = []
+        previous_score = None
+        rank = 0
+        for i, (reward_id, score) in enumerate(sorted_rewards):
+            rank = i + 1 if score != previous_score else rank
+            ranks.append((reward_id, rank, score))
+            previous_score = score
+        
+        # Restore the original order
+        ranks.sort(key=lambda x: x[0])
+
+        # Calculate incentive rewards based on the rank, applying the cubic function for positive scores
+        def incentive_formula(rank):
+            reward_value = -1.038e-7 * rank**3 + 6.214e-5 * rank**2 - 0.0129 * rank - 0.0118
+            # Scale up the reward value between 0 and 1
+            scaled_reward_value = reward_value + 1
+            return scaled_reward_value
+        
+        incentive_rewards = [
+            (incentive_formula(rank) if score > 0 else 0) for _, rank, score in ranks
+        ]
+        
+        self.miner_manager.update_scores(final_uids, incentive_rewards, representative_logs)
+        
+        # Reset logs for next epoch
+        self.miner_scores = []
+        self.miner_reward_logs = []
+        self.miner_uids = []
 
     def prepare_challenge(self, uids_should_rewards, category):
         """
@@ -193,7 +348,8 @@ class Validator(BaseValidatorNeuron):
                 if info.category == category
             ]
         )
-        batch_size = min(4, 1 + model_miner_count // 4)
+        # The batch size is 8 or the number of miners
+        batch_size = min(8, model_miner_count)
         random.shuffle(uids_should_rewards)
         batched_uids_should_rewards = [
             uids_should_rewards[i * batch_size : (i + 1) * batch_size]
@@ -201,12 +357,10 @@ class Validator(BaseValidatorNeuron):
         ]
         num_batch = len(batched_uids_should_rewards)
 
-        synapses = [
-            synapse_type(category=category, timeout=timeout) for _ in range(num_batch)
-        ]
-        for synapse in synapses:
-            synapse = challenger(synapse)
-
+        ## clone one synapse to number_batch synapses
+        synapse = synapse_type(category=category, timeout=timeout)
+        synapse = challenger(synapse)
+        synapses = [deepcopy(synapse) for _ in range(num_batch)]
         return synapses, batched_uids_should_rewards
 
     def update_scores_on_chain(self):
@@ -236,49 +390,96 @@ class Validator(BaseValidatorNeuron):
         bt.logging.success(f"\033[1;32m✅ Updated scores: {self.scores}\033[0m")
 
     def save_state(self):
-        """Saves the state of the validator to a file."""
-
-        torch.save(
-            {
-                "step": self.step,
-                "all_uids_info": self.miner_manager.all_uids_info,
-            },
-            self.config.neuron.full_path + "/state.pt",
-        )
-
-    def load_state(self):
-        """Loads the state of the validator from a file."""
-
-        # Load the state of the validator from file.
+        """Saves the state of the validator to a file using pickle."""
+        state = {
+            "step": self.step,
+            "all_uids_info": self.miner_manager.all_uids_info,
+        }
         try:
-            path = self.config.neuron.full_path + "/state.pt"
-            bt.logging.info(
-                "\033[1;32m🧠 Loading validator state from: " + path + "\033[0m"
-            )
-            state = torch.load(path)
-            self.step = state["step"]
-            all_uids_info = state["all_uids_info"]
-            for k, v in all_uids_info.items():
-                v = v.to_dict()
-                self.miner_manager.all_uids_info[k] = MinerInfo(**v)
-            bt.logging.info("\033[1;32m✅ Successfully loaded state\033[0m")
+            # Open the file in write-binary mode
+            with open(self.config.neuron.full_path + "/state.pkl", "wb") as f:
+                pickle.dump(state, f)
+            bt.logging.info("State successfully saved to state.pkl")
         except Exception as e:
-            self.step = 0
-            bt.logging.info(
-                "\033[1;33m⚠️ Could not find previously saved state.\033[0m", e
-            )
+            bt.logging.error(f"Failed to save state: {e}")
+    def load_state(self):
+        """Loads state of  validator from a file, with fallback to .pt if .pkl is not found."""
+        # TODO: After a transition period, remove support for the old .pt format.
+        try:
+            path_pt = self.config.neuron.full_path + "/state.pt"
+            path_pkl = self.config.neuron.full_path + "/state.pkl"
+
+            # Try to load the newer .pkl format first
+            try:
+                bt.logging.info(f"Loading validator state from: {path_pkl}")
+                with open(path_pkl, "rb") as f:
+                    state = pickle.load(f)
+
+                # Restore state from pickle file
+                self.step = state["step"]
+                self.miner_manager.all_uids_info = state["all_uids_info"]
+                bt.logging.info("Successfully loaded state from .pkl file")
+                return  # Exit after successful load from .pkl
+
+            except Exception as e:
+                bt.logging.warning(f"Failed to load from .pkl format: {e}")
+
+            # If .pkl loading fails, try to load from the old .pt file (PyTorch format)
+            try:
+                bt.logging.info(f"Loading validator state from: {path_pt}")
+                state = torch.load(path_pt)
+
+                # Restore state from .pt file
+                self.step = state["step"]
+                self.miner_manager.all_uids_info = state["all_uids_info"]
+                bt.logging.info("Successfully loaded state from .pt file")
+
+            except Exception as e:
+                bt.logging.error(f"Failed to load from .pt format: {e}")
+                self.step = 0  # Default fallback when both load attempts fail
+                bt.logging.error("Could not find previously saved state or error loading it.")
+
+        except Exception as e:
+            self.step = 0  # Default fallback in case of an unknown error
+            bt.logging.error(f"Error loading state: {e}")
+
 
     def store_miner_infomation(self):
         miner_informations = self.miner_manager.to_dict()
 
         def _post_miner_informations(miner_informations):
-            requests.post(
-                url=self.config.storage.storage_url,
-                json={
-                    "miner_information": miner_informations,
-                    "validator_uid": int(self.uid),
-                },
-            )
+            # Convert miner_informations to a JSON-serializable format
+            serializable_miner_informations = convert_to_serializable(miner_informations)
+            
+            try:
+                response = requests.post(
+                    url=self.config.storage.storage_url,
+                    json={
+                        "miner_information": serializable_miner_informations,
+                        "validator_uid": int(self.uid),
+                    },
+                )
+                if response.status_code == 200:
+                    bt.logging.info("\033[1;32m✅ Miner information successfully stored.\033[0m")
+                else:
+                    bt.logging.warning(
+                        f"\033[1;33m⚠️ Failed to store miner information, status code: {response.status_code}\033[0m"
+                    )
+            except requests.exceptions.RequestException as e:
+                bt.logging.error(f"\033[1;31m❌ Error storing miner information: {e}\033[0m")
+
+        def convert_to_serializable(data):
+            # Implement conversion logic for serialization
+            if isinstance(data, dict):
+                return {key: convert_to_serializable(value) for key, value in data.items()}
+            elif isinstance(data, list):
+                return [convert_to_serializable(element) for element in data]
+            elif isinstance(data, (int, str, bool, float)):
+                return data
+            elif hasattr(data, '__float__'):
+                return float(data)
+            else:
+                return str(data)
 
         thread = threading.Thread(
             target=_post_miner_informations,

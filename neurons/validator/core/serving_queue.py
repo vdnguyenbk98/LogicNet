@@ -22,13 +22,13 @@ class QueryQueue:
         self.proxy_queue: dict[str, queue.Queue[QueryItem]] = {
             category: queue.Queue() for category in categories
         }
-        self.synthentic_rewarded = []
+        self.synthentic_rewarded = {}
         self.time_per_loop = time_per_loop
         self.total_uids_remaining = 0
 
     def update_queue(self, all_uids_info):
         self.total_uids_remaining = 0
-        self.synthentic_rewarded = []
+        self.synthentic_rewarded = {}
         for q in self.synthentic_queue.values():
             q.queue.clear()
         for q in self.proxy_queue.values():
@@ -81,20 +81,35 @@ class QueryQueue:
                     more_data = True
                     query_item = q.get()
                     uids_to_query.append(query_item.uid)
-                    if query_item.uid in self.synthentic_rewarded:
-                        should_rewards.append(False)
-                    else:
-                        should_rewards.append(True)
-                        self.synthentic_rewarded.append(query_item.uid)
+                    should_rewards.append(self.random_should_reward(query_item.uid))
+
+                    if query_item.uid not in self.synthentic_rewarded:
+                        self.synthentic_rewarded[query_item.uid] = 0
+                    self.synthentic_rewarded[query_item.uid] += 1
 
                 yield category, uids_to_query, should_rewards, time_to_sleep
+
+    def random_should_reward(self, uid):
+        if uid not in self.synthentic_rewarded or self.synthentic_rewarded[uid] <= 10:
+            return True
+        if self.synthentic_rewarded[uid] <= 20:
+            return random.random() < 0.5 ## 50% chance of rewarding
+        elif self.synthentic_rewarded[uid] <= 30:
+            return random.random() < 0.3 ## 30% chance of rewarding
+        elif self.synthentic_rewarded[uid] <= 40:
+            return random.random() < 0.2 ## 20% chance of rewarding
+        else:
+            return random.random() < 0.1 ## 10% chance of rewarding
+
 
     def get_query_for_proxy(self, category):
         synthentic_q = self.synthentic_queue[category]
         proxy_q = self.proxy_queue[category]
         while not synthentic_q.empty():
             query_item = synthentic_q.get()
-            should_reward = query_item.uid not in self.synthentic_rewarded
+            should_reward = False
+            if (query_item.uid not in self.synthentic_rewarded) or (self.synthentic_rewarded[query_item.uid] <= 20):
+                should_reward = True
             yield query_item.uid, should_reward
         while not proxy_q.empty():
             query_item = proxy_q.get()

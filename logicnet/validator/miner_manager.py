@@ -14,10 +14,10 @@ class MinerInfo:
     def __init__(
         self,
         category: str = "",
-        scores: list[float] = [],
-        epoch_volume: int = 42,
+        scores: list[float] = None,
+        epoch_volume: int = None,
         reward_scale: float = 0.0,
-        reward_logs: list[dict] = [],
+        reward_logs: list[dict] = None,
         *args,
         **kwargs,
     ):
@@ -29,12 +29,12 @@ class MinerInfo:
             epoch_volume (int, optional): No of requests / epoch commited by miner. Defaults to 42.
             reward_scale (float, optional): The scale value applied to miner reward each epoch. Defaults to 0.0.
         """
-        self.scores: list[float] = scores
-        self.epoch_volume: int = epoch_volume
+        self.scores: list[float] = scores if scores is not None else []
+        self.epoch_volume: int = epoch_volume if epoch_volume is not None else 512
         self.rate_limit = 0
         self.category: str = category
         self.reward_scale: float = reward_scale
-        self.reward_logs = reward_logs
+        self.reward_logs = reward_logs if reward_logs is not None else []
 
     def __str__(self):
         return str(self.to_dict()) + "\n"
@@ -77,7 +77,7 @@ class MinerManager:
             query_axons,
             synapse,
             deserialize=False,
-            timeout=10,
+            timeout=60,
         )
         responses = {
             uid: response.response_dict
@@ -100,7 +100,13 @@ class MinerManager:
             miner_distribution = {}
             for uid, info in valid_miners_info.items():
                 # info = self.all_uids_info[int(uid)] if int(uid) in self.all_uids_info else MinerInfo(**info)
-                info = MinerInfo(**info)
+                miner_state = self.all_uids_info.setdefault(
+                    uid,
+                    {"scores": [], "reward_logs": []},
+                )
+                miner_state.category = info.get("category", "")
+                miner_state.epoch_volume = info.get("epoch_volume") if info.get("epoch_volume") else 512
+                info = miner_state
                 rate_limit_per_validator: dict = get_rate_limit_per_validator(
                     metagraph=self.validator.metagraph,
                     epoch_volume=info.epoch_volume,
@@ -128,7 +134,6 @@ class MinerManager:
         """
         Get miner uids based on category, useful if subnet has multiple categories
         """
-        print(self.all_uids_info)
         available_uids = [
             int(uid)
             for uid in self.all_uids_info.keys()
