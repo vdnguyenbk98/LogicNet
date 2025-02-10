@@ -1,6 +1,7 @@
 import torch
 import openai
 import sympy
+import random
 import bittensor as bt
 from concurrent import futures
 from logicnet.protocol import LogicSynapse
@@ -9,9 +10,9 @@ from logicnet.utils.model_selector import model_selector
 from logicnet.utils.regex_helper import extract_numerical_part
 from logicnet.validator.prompt import DETECT_TRICK_TEMPLATE, CORRECTNESS_TEMPLATE
 
-SIMILARITY_WEIGHT = 0.2
-CORRECTNESS_WEIGHT = 0.8
-PROCESSING_TIME_WEIGHT = -0.1
+SIMILARITY_WEIGHT = 0.3
+CORRECTNESS_WEIGHT = 0.7
+PROCESSING_TIME_WEIGHT = -0.05
 
 
 
@@ -77,10 +78,16 @@ class LogicRewarder:
 
                 # Scale up the reward
                 reward = reward / 2 + 0.5
-                bt.logging.debug(
-                    f"[REWARDER][{task_uid}] similarity: {similarities[i]}, correctness: {correctness[i]}, process_time: {process_times[i]}, final_reward: {reward}"
-                )
                 valid_rewards.append(reward)
+
+                try:               
+                    ## show the reward, correctness, similarity for valid ids
+                    bt.logging.info(
+                        f"[REWARDER][{task_uid}] Valid_id: {valid_uids[i]} Reward: {reward}, Correctness: {correctness[i]}, Similarity: {similarities[i]}, process_time: {process_times[i]}, miner_response: {valid_responses[i].logic_answer.strip()} \n\n"
+                    )
+                except Exception as e:
+                    bt.logging.error(f"Error in logging reward for valid ids: {e}")
+
 
         total_uids = valid_uids + invalid_uids
         rewards = valid_rewards + invalid_rewards
@@ -115,32 +122,33 @@ class LogicRewarder:
             raise ValueError("API key is not valid or not provided.")
         
         openai_client = openai.OpenAI(base_url=base_url, api_key=api_key)
-        bt.logging.debug(f"Initiating request with model '{model}' at base URL '{base_url}'.")
+        bt.logging.info(f"Initiating request with model '{model}' at base URL '{base_url}'.")
 
         ground_truth_answer = base_synapse.ground_truth_answer
-        bt.logging.debug(f"[CORRECTNESS] Ground truth: {ground_truth_answer}")
+        bt.logging.info(f"[CORRECTNESS] Ground truth: {ground_truth_answer}")
         correctness = []
         batch_llm_inputs = []
         indices_for_llm = []
 
         for idx, response in enumerate(responses):
             miner_answer = response.logic_answer.strip()
+            bt.logging.info(f"[CORRECTNESS] Miner response: {miner_answer}")
             # Try programmatic comparison
-            score = self._compare_numerical_answers(ground_truth_answer, miner_answer)
-            if score is not None:
-                correctness.append(score)
-                bt.logging.debug(f"[CORRECTNESS] Used programmatic comparison for response {idx} with score {score}")
-            else:
-                # Need LLM evaluation
-                bt.logging.debug(f"[CORRECTNESS] Unable to use programmatic comparison. Need LLM evaluation for response {idx}")
-                correctness.append(0)  # Placeholder
-                batch_llm_inputs.append({
-                    "question": base_synapse.raw_logic_question,
-                    "ground_truth_answer": ground_truth_answer,
-                    "response": miner_answer
-                })
-                # log bt.debug for what score did the LLM give
-                indices_for_llm.append(idx)
+            # score = self._compare_numerical_answers(ground_truth_answer, miner_answer)
+            # if score is not None:
+            #     correctness.append(score)
+            #     bt.logging.info(f"[CORRECTNESS] Used programmatic comparison for response {idx} with score {score}")
+            # else:
+            # Need LLM evaluation
+            bt.logging.info(f"[CORRECTNESS] Unable to use programmatic comparison. Need LLM evaluation for response {idx}")
+            correctness.append(0)  # Placeholder
+            batch_llm_inputs.append({
+                "question": base_synapse.raw_logic_question,
+                "ground_truth_answer": ground_truth_answer,
+                "response": miner_answer
+            })
+            # log bt.debug for what score did the LLM give
+            indices_for_llm.append(idx)
 
         if batch_llm_inputs:
             with futures.ThreadPoolExecutor() as executor:
@@ -157,7 +165,7 @@ class LogicRewarder:
                             batch_llm_inputs,
                         )
                         for idx, score in zip(indices_for_llm, llm_scores):
-                            bt.logging.debug(f"[CORRECTNESS] Rating: {score}")
+                            bt.logging.info(f"[CORRECTNESS] Rating: {score}")
                             correctness[idx] = score
                         break
                     except Exception as e:
@@ -183,22 +191,23 @@ class LogicRewarder:
 
         ## check trick case
         try:
+            strings = ['a', 'b', 'c', 'd', 'e'] ## add to response to avoid gpt cached the output
             response_str = openai_client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {
                         "role": "user",
                         "content": DETECT_TRICK_TEMPLATE.format(
-                            response=response
+                            response=str(random.choice(strings)) + response + str(random.choice(strings))
                         ),
                     },
                 ],
                 max_tokens=5,
                 temperature=0,
             ).choices[0].message.content.strip().lower()
-            bt.logging.debug(f"[CORRECTNESS] Trick detection: {response_str}")
+            bt.logging.info(f"[CORRECTNESS] Trick detection: {response_str}")
             if "yes" in response_str:
-                return 0
+                return -1
         except Exception as e:
             bt.logging.error(f"API request failed: {e}")
         
@@ -218,7 +227,7 @@ class LogicRewarder:
                 max_tokens=15,
                 temperature=0,
             ).choices[0].message.content.strip().lower()
-            bt.logging.debug(f"[CORRECTNESS] Rating: {response_str}")
+            bt.logging.info(f"[CORRECTNESS] Rating: {response_str}")
             try:
                 correctness_score = float(response_str)
                 return min(max(correctness_score, 0.0), 1.0)
@@ -237,7 +246,7 @@ class LogicRewarder:
             else:
                 try:
                     openai_client = openai.OpenAI(base_url=base_url, api_key=api_key)
-                    bt.logging.debug(f"Initiating request with model '{model}' at base URL '{base_url}'.")
+                    bt.logging.info(f"Initiating request with model '{model}' at base URL '{base_url}'.")
                     response_str = openai_client.chat.completions.create(
                         model=model_name,
                         messages=[
@@ -253,7 +262,7 @@ class LogicRewarder:
                         max_tokens=15,
                         temperature=0,
                     ).choices[0].message.content.strip().lower()
-                    bt.logging.debug(f"[CORRECTNESS] Rating: {response_str}")
+                    bt.logging.info(f"[CORRECTNESS] Rating: {response_str}")
                     correctness_score = float(response_str)
                     return min(max(correctness_score, 0.0), 1.0)
                 except Exception as e:
@@ -288,7 +297,7 @@ class LogicRewarder:
             gt_abs = abs(gt_value) + epsilon
             relative_error = abs_difference / gt_abs
             # Logs for debugging
-            bt.logging.debug(f"[CORRECTNESS DEBUG FOR NUMERICAL COMPARISON]: Absolute difference: {abs_difference}, Relative error: {relative_error}")
+            bt.logging.info(f"[CORRECTNESS DEBUG FOR NUMERICAL COMPARISON]: Absolute difference: {abs_difference}, Relative error: {relative_error}")
 
             correctness_score = max(0.0, 1.0 - relative_error)
             correctness_score = min(correctness_score, 1.0)
@@ -350,7 +359,7 @@ class LogicRewarder:
             raise ValueError("API key is not valid or not provided.")
 
         openai_client = openai.OpenAI(base_url=base_url, api_key=api_key)
-        bt.logging.debug(f"Initiating request with model '{model}' at base URL '{base_url}'.")
+        bt.logging.info(f"Initiating request with model '{model}' at base URL '{base_url}'.")
 
         response = ""
         for attempt in range(3):  # Retry up to 3 times
@@ -362,7 +371,7 @@ class LogicRewarder:
                     temperature=0.7,
                 )
                 response = response.choices[0].message.content
-                bt.logging.debug(f"[SIMILARITY] Self-generated ground truth: {response}")
+                bt.logging.info(f"[SIMILARITY] Self-generated ground truth: {response}")
                 return response  # Return response if successful
             
             except openai.OpenAIError as e:
@@ -375,7 +384,7 @@ class LogicRewarder:
 
                     else:
                         openai_client = openai.OpenAI(base_url=base_url, api_key=api_key)
-                        bt.logging.debug(f"Initiating request with model '{model}' at base URL '{base_url}'.")
+                        bt.logging.info(f"Initiating request with model '{model}' at base URL '{base_url}'.")
                         try:
                             response = openai_client.chat.completions.create(
                                 model=model,
@@ -384,7 +393,7 @@ class LogicRewarder:
                                 temperature=0.7,
                             )
                             response = response.choices[0].message.content
-                            bt.logging.debug(f"[SIMILARITY] Self-generated ground truth: {response}")
+                            bt.logging.info(f"[SIMILARITY] Self-generated ground truth: {response}")
                             return response
                         except openai.OpenAIError as e:
                             bt.logging.error(f"API request failed after switching: {e}")

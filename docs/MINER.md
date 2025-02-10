@@ -109,7 +109,7 @@ Alternatively, you can use together.ai's API to access various language models w
      --subtensor.network finney \
      --axon.port "your-open-port" \
      --miner.category Logic \
-     --miner.epoch_volume 200 \
+     --miner.epoch_volume 50 \
      --miner.llm_client.base_url https://api.together.xyz/v1 \
      --miner.llm_client.model "model_id_from_list" \
      --miner.llm_client.key $TOGETHER_API_KEY \

@@ -4,10 +4,11 @@ import torch
 from logicnet.utils.volume_setting import (
     get_rate_limit_per_validator,
     MIN_RATE_LIMIT,
+    MAX_RATE_LIMIT,
 )
 import traceback
 
-NO_OF_RECENT_SCORES = 20
+NO_OF_RECENT_SCORES = 10
 
 
 class MinerInfo:
@@ -113,9 +114,12 @@ class MinerManager:
                     min_stake=self.validator.config.min_stake,
                     log=False,
                 )
-                info.rate_limit = rate_limit_per_validator.get(
+                rate_limit = rate_limit_per_validator.get(
                     self.validator.uid, MIN_RATE_LIMIT
                 )
+                if rate_limit > MAX_RATE_LIMIT:
+                    rate_limit = MAX_RATE_LIMIT
+                info.rate_limit = rate_limit
                 info.reward_scale = max(min(info.epoch_volume / 512, 1), 0)
                 self.all_uids_info[int(uid)] = info
                 miner_distribution.setdefault(info.category, []).append(uid)

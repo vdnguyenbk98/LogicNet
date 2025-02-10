@@ -16,6 +16,8 @@ from neurons.validator.validator_proxy import ValidatorProxy
 from logicnet.base.validator import BaseValidatorNeuron
 from logicnet.validator import MinerManager, LogicChallenger, LogicRewarder, MinerInfo
 from logicnet.utils.wandb_manager import WandbManager
+from logicnet.utils.text_uts import modify_question
+from logicnet.protocol import LogicSynapse
 from neurons.validator.core.serving_queue import QueryQueue
 
 
@@ -231,12 +233,25 @@ class Validator(BaseValidatorNeuron):
             bt.logging.info(f"\033[1;34m🧠 Synapse to be sent to miners: {synapse}\033[0m")
             axons = [self.metagraph.axons[int(uid)] for uid in uids]
             bt.logging.debug(f"\033[1;34m🧠 Axon: {axons}\033[0m")
+
+            ## loop for each miner, add noise and send the synapse to the miner
+            # responses = []
+            # for axon in axons:
+            #     noise_synapse = self.add_noise_to_synapse_question(synapse)
+            #     response = dendrite.query(
+            #         axons=axon,
+            #         synapse=noise_synapse,
+            #         deserialize=False,
+            #         timeout=self.categories[category]["timeout"],
+            #     )
+            #     responses.append(response)
             responses = dendrite.query(
                 axons=axons,
                 synapse=synapse,
                 deserialize=False,
                 timeout=self.categories[category]["timeout"],
             )
+
             reward_responses = [
                 response
                 for response, should_reward in zip(responses, should_rewards)
@@ -269,6 +284,16 @@ class Validator(BaseValidatorNeuron):
                     self.miner_uids.append(uids) 
                     self.miner_scores.append(rewards)
 
+    def add_noise_to_synapse_question(self, synapse: ln.protocol.LogicSynapse):
+        """
+        Add noise to the synapse question.
+        """
+        ##copy the synapse
+        copy_synapse = deepcopy(synapse)
+        ##modify the question
+        copy_synapse.logic_question = modify_question(copy_synapse.logic_question)
+        return copy_synapse
+
     def assign_incentive_rewards(self, uids, rewards, reward_logs):
         """
         Calculate incentive rewards based on the rank.
@@ -296,6 +321,8 @@ class Validator(BaseValidatorNeuron):
                
         ## compute mean value of rewards
         final_rewards = [sum(uid_rewards) / len(uid_rewards) for uid_rewards in uids_scores.values()]
+        ## set the rewards to 0 if the mean is negative
+        final_rewards = [reward if reward > 0 else 0 for reward in final_rewards]
 
         # Now proceed with the incentive rewards calculation on these mean attempts
         original_rewards = list(enumerate(final_rewards))
@@ -357,10 +384,11 @@ class Validator(BaseValidatorNeuron):
         ]
         num_batch = len(batched_uids_should_rewards)
 
-        ## clone one synapse to number_batch synapses
-        synapse = synapse_type(category=category, timeout=timeout)
-        synapse = challenger(synapse)
-        synapses = [deepcopy(synapse) for _ in range(num_batch)]
+        synapses = []
+        for i in range(num_batch):
+            synapse = synapse_type(category=category, timeout=timeout)
+            synapse = challenger(synapse)
+            synapses.append(synapse)
         return synapses, batched_uids_should_rewards
 
     def update_scores_on_chain(self):
