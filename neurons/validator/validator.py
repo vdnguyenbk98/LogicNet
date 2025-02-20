@@ -1,8 +1,11 @@
 import os
 from dotenv import load_dotenv
+import asyncio
 load_dotenv()
 import pickle
 import time
+import json
+import re
 import threading
 import datetime
 import random
@@ -12,6 +15,7 @@ import requests
 from copy import deepcopy
 import bittensor as bt
 import logicnet as ln
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from neurons.validator.validator_proxy import ValidatorProxy
 from logicnet.base.validator import BaseValidatorNeuron
 from logicnet.validator import MinerManager, LogicChallenger, LogicRewarder, MinerInfo
@@ -19,6 +23,8 @@ from logicnet.utils.wandb_manager import WandbManager
 from logicnet.utils.text_uts import modify_question
 from logicnet.protocol import LogicSynapse
 from neurons.validator.core.serving_queue import QueryQueue
+from collections import defaultdict
+import wandb
 
 
 def init_category(config=None, model_rotation_pool=None, dataset_weight=None):
@@ -139,6 +145,8 @@ class Validator(BaseValidatorNeuron):
                     + traceback.format_exc()
                     + "\033[0m"
                 )
+        # Initialize ThreadPoolExecutor
+        self.worker_thread_pool = ThreadPoolExecutor(max_workers=self.config.max_workers)
 
     def forward(self):
         """
@@ -167,6 +175,7 @@ class Validator(BaseValidatorNeuron):
                 self.wandb_manager.init_wandb()
 
         # Query and reward
+        futures_with_metadata = []
         for (
             category,
             uids,
@@ -176,22 +185,26 @@ class Validator(BaseValidatorNeuron):
             bt.logging.info(
                 f"\033[1;34m🔍 Querying {len(uids)} uids for model {category}, sleep_per_batch: {sleep_per_batch}\033[0m"
             )
-
-            thread = threading.Thread(
-                target=self.async_query_and_reward,
-                args=(category, uids, should_rewards),
-            )
-            threads.append(thread)
-            thread.start()
+            future = self.worker_thread_pool.submit(
+                self.async_query_and_reward, 
+                category, 
+                uids, 
+                should_rewards
+            ) 
+            futures_with_metadata.append((future, category, uids, should_rewards))
 
             bt.logging.info(
                 f"\033[1;34m😴 Sleeping for {sleep_per_batch} seconds between batches\033[0m"
             )
             time.sleep(sleep_per_batch)
         
-        # Wait for all threads to complete
-        for thread in threads:
-            thread.join()
+        # Wait for all submitted tasks to complete
+        for future, category, uids, should_rewards in as_completed(futures_with_metadata):
+            try:
+                future.result()
+            except Exception as exc:
+                # Get the args that were passed to the failed task
+                bt.logging.warning(f"\033[1;33m⚠️ Task failed with error: {exc}\nFuture: {future}\nCategory: {category}\nUids: {uids}\nShould rewards: {should_rewards}\033[0m")
 
         # Assign incentive rewards
         self.assign_incentive_rewards(self.miner_uids, self.miner_scores, self.miner_reward_logs)
@@ -209,12 +222,17 @@ class Validator(BaseValidatorNeuron):
             )
             time.sleep(loop_base_time - actual_time_taken)
 
+
     def async_query_and_reward(
         self,
         category: str,
         uids: list[int],
         should_rewards: list[int],
     ):
+        # Create new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         dendrite = bt.dendrite(self.wallet)
         uids_should_rewards = list(zip(uids, should_rewards))
         synapses, batched_uids_should_rewards = self.prepare_challenge(
@@ -223,28 +241,13 @@ class Validator(BaseValidatorNeuron):
         
         for synapse, uids_should_rewards in zip(synapses, batched_uids_should_rewards):
             uids, should_rewards = zip(*uids_should_rewards)
-            bt.logging.info(
-                f"\033[1;34m🔍 Querying {uids}, Should reward: {should_rewards}\033[0m"
-            )
             if not synapse:
                 continue
             base_synapse = synapse.model_copy()
             synapse = synapse.miner_synapse()
             bt.logging.info(f"\033[1;34m🧠 Synapse to be sent to miners: {synapse}\033[0m")
             axons = [self.metagraph.axons[int(uid)] for uid in uids]
-            bt.logging.debug(f"\033[1;34m🧠 Axon: {axons}\033[0m")
 
-            ## loop for each miner, add noise and send the synapse to the miner
-            # responses = []
-            # for axon in axons:
-            #     noise_synapse = self.add_noise_to_synapse_question(synapse)
-            #     response = dendrite.query(
-            #         axons=axon,
-            #         synapse=noise_synapse,
-            #         deserialize=False,
-            #         timeout=self.categories[category]["timeout"],
-            #     )
-            #     responses.append(response)
             responses = dendrite.query(
                 axons=axons,
                 synapse=synapse,
@@ -261,28 +264,37 @@ class Validator(BaseValidatorNeuron):
                 uid for uid, should_reward in zip(uids, should_rewards) if should_reward
             ]
 
-            bt.logging.info(
-                f"\033[1;34m🔍 Received {len(responses)} responses, {len(reward_responses)} to be rewarded\033[0m"
-            )
-
             if reward_uids:
                 uids, rewards, reward_logs = self.categories[category]["rewarder"](
                     reward_uids, reward_responses, base_synapse
                 )
 
-                for i, uid in enumerate(reward_uids):
+                for i, uid in enumerate(uids):
                     if rewards[i] > 0:
                         rewards[i] = rewards[i] * (
-                            0.9
-                            + 0.1 * self.miner_manager.all_uids_info[uid].reward_scale
+                            0.9 + 0.1 * self.miner_manager.all_uids_info[uid].reward_scale
                         )
 
-                bt.logging.info(f"\033[1;32m🏆 Scored responses: {rewards}\033[0m")
+                unique_logs = {}
+                for log in reward_logs:
+                    miner_uid = log["miner_uid"]
+                    if miner_uid not in unique_logs:
+                        unique_logs[miner_uid] = log
 
-                if rewards and reward_logs and uids: 
+                logs_str = []
+                for log in unique_logs.values():
+                    self._log_wandb(log)
+                    logs_str.append(
+                        f"Task ID: [{log['task_uid']}], Miner UID: {log['miner_uid']}, Reward: {log['reward']}, Correctness: {log['correctness']}, Similarity: {log['similarity']}, Process Time: {log['process_time']}, Miner Response: {log['miner_response']}, Ground Truth: {log['ground_truth']}"
+                    )
+                formatted_logs_str = json.dumps(logs_str, indent=5)
+                bt.logging.info(f"\033[1;32m🏆 Miner Scores: {formatted_logs_str}\033[0m")
+                if rewards and reward_logs and uids:
                     self.miner_reward_logs.append(reward_logs)
-                    self.miner_uids.append(uids) 
+                    self.miner_uids.append(uids)
                     self.miner_scores.append(rewards)
+
+        loop.close()
 
     def add_noise_to_synapse_question(self, synapse: ln.protocol.LogicSynapse):
         """
@@ -376,7 +388,7 @@ class Validator(BaseValidatorNeuron):
             ]
         )
         # The batch size is 8 or the number of miners
-        batch_size = min(8, model_miner_count)
+        batch_size = min(4, model_miner_count)
         random.shuffle(uids_should_rewards)
         batched_uids_should_rewards = [
             uids_should_rewards[i * batch_size : (i + 1) * batch_size]
@@ -514,6 +526,61 @@ class Validator(BaseValidatorNeuron):
             args=(miner_informations,),
         )
         thread.start()
+
+    def _log_wandb(self, log):
+        """
+        Log reward logs to wandb as a table with the following columns:
+            [
+                "miner_uid",
+                "miner_response",
+                "miner_reasoning"
+                "reward",
+                "correctness",
+                "similarity",
+                "processing_time",
+                "question",
+                "logic_question",
+                "ref_ground_truth",
+                "ground_truth_answer",
+                
+            ]
+        Each row in the table is for one UID, containing lists of their tasks, responses, scores, etc.
+        """
+        try:
+            # 1) Guard clauses
+            if not self.wandb_manager or not self.wandb_manager.wandb:
+                bt.logging.warning("Wandb is not initialized. Skipping logging.")
+                return
+            if not log:
+                bt.logging.warning("No reward logs available. Skipping wandb logging.")
+                return
+
+            # 2) Prepare the final data to log
+            wandb_data = {
+                "miner_uid":log["miner_uid"],
+                "task_uid": log["task_uid"],
+                "miner_response": log["miner_response"],
+                "miner_reasoning": log["miner_reasoning"],
+                "reward": log["reward"],
+                "correctness": log["correctness"],
+                "similarity": log["similarity"],
+                "processing_time": log["process_time"],
+                "question": log["question"],
+                "logic_question": log["logic_question"],
+                "ref_ground_truth": log["ref_ground_truth"],
+                "ground_truth": log["ground_truth"],
+            }
+
+            # 3) Log to wandb
+            self.wandb_manager.wandb.log(wandb_data, commit=True)
+
+            # 4) Debug
+            bt.logging.info(
+                f"Logged to wandb (epoch_or_step={self.step}):\n"
+                f"{json.dumps(wandb_data, indent=2, default=str)}"
+            )
+        except Exception as e:
+            bt.logging.error(f"Error logging to wandb: {e}")
 
 
 # The main function parses the configuration and runs the validator.
