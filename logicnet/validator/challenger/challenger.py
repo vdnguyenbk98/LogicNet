@@ -55,63 +55,23 @@ class LogicChallenger:
         Returns:
             (atom_logic_question, atom_logic_answer) as a tuple of strings.
         """
-        resources = ['mathgenerator', 'gsm8k', 'mmlustem']
-
-        if len(self.dataset_weight) == 3:
-            selected_resource = random.choices(resources, weights=self.dataset_weight, k=1)[0]
-        else:
-            bt.logging.warning("Invalid dataset weight configuration provided. Using default weights.")
-            selected_resource = random.choices(resources, weights=DATASET_WEIGHT, k=1)[0]
-
-        bt.logging.debug(f"Selected resource: {selected_resource}")
         try:
             # Select an atom question and answer from the Mathgenerator
-            if selected_resource == 'mathgenerator':
-                selected_topic = random.choice(topics)
-                subtopic = selected_topic["subtopic"]
-                topic = selected_topic["topic"]
-                atom_question, atom_answer = eval(f"mathgenerator.{topic}.{subtopic}()")
-                if atom_question is None or atom_answer is None:
-                    raise ValueError("Failed to get atom logic problem")
-                bt.logging.debug("Generating math problem using Mathgenerator.")
-                subtopic = subtopic.replace("_", " ").capitalize()
-                topic = topic.replace("_", " ").capitalize()
-                atom_question = atom_question.replace("$", "").strip()
-                atom_question = (
-                    f"Find the solution of this math problem:\n---\n"
-                    f"Topic: {topic}, Subtopic: {subtopic}.\n{atom_question}\n---\n"
-                )
-
-            # Select an atom question and answer from the GSM8K
-            elif selected_resource == 'gsm8k':
-                ds = load_dataset("openai/gsm8k", "main")
-                bt.logging.debug("Generating problem using GSM8K dataset.")
-                data_set = ds['train']
-                bt.logging.info(f"Loaded GSM8K dataset with {len(data_set['question'])} entries")
-                random_index = random.randint(0, len(data_set['question']) - 1)
-                question = data_set['question'][random_index]
-                answer = data_set['answer'][random_index]
-                if "####" in answer:
-                    answer = answer.split("####")[1]
-                atom_question = f"Find the solution of this question:\n---\n{question}\n---\n"
-                atom_answer = answer
-
-            # Select an atom question and answer from the MMLU-STEM
-            else:
-                ds = load_dataset("TIGER-Lab/MMLU-STEM")
-                bt.logging.debug("Generating problem using MMLU-STEM dataset.")
-                data_set = ds['test']
-                data_set = data_set.filter(lambda x: "Statement" not in x['question'])
-                bt.logging.info(f"Loaded MMLU-STEM dataset with {len(data_set['question'])} entries")
-                random_index = random.randint(0, len(data_set['question']) - 1)
-                question = data_set['question'][random_index]
-                answer_id = data_set['answer'][random_index]
-                answer_choice = data_set['choices'][random_index]
-                atom_question = f"Find the solution of this question:\n---\n{question}\n---\n"
-                atom_answer = answer_choice[answer_id]
-
+            selected_topic = random.choice(topics)
+            subtopic = selected_topic["subtopic"]
+            topic = selected_topic["topic"]
+            atom_question, atom_answer = eval(f"mathgenerator.{topic}.{subtopic}()")
+            if atom_question is None or atom_answer is None:
+                raise ValueError("Failed to get atom logic problem")
+            bt.logging.debug("Generating math problem using Mathgenerator.")
+            subtopic = subtopic.replace("_", " ").capitalize()
+            topic = topic.replace("_", " ").capitalize()
+            atom_question = atom_question.replace("$", "").strip()
+            atom_question = (
+                f"Find the solution of this math problem:\n---\n"
+                f"Topic: {topic}, Subtopic: {subtopic}.\n{atom_question}\n---\n"
+            )
         except Exception as e:
-            bt.logging.error(f"Error accessing dataset {selected_resource}: {e}. Attempting to load an alternative dataset.")
             self.retry_count += 1
             if self.retry_count > 3:
                 bt.logging.error("Max retries reached. Returning a default question and answer.")

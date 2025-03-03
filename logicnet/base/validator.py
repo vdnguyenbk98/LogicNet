@@ -255,7 +255,7 @@ class BaseValidatorNeuron(BaseNeuron):
         for uid, hotkey in enumerate(self.hotkeys):
             if (hotkey != self.metagraph.hotkeys[uid]):
                 bt.logging.info(f"\033[1;32m🔄 Hotkey {hotkey} has been replaced\033[0m")
-                # self.scores[uid] = 0  # hotkey has been replaced
+                self.scores[uid] = 0  # hotkey has been replaced
 
         # Check to see if the metagraph has changed size.
         # If so, we need to add new hotkeys and moving averages.
